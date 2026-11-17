@@ -172,6 +172,11 @@ public class GraphQLProvider {
 
 	protected String processGraphQLRequest(
 			ServletRequestDetails theRequestDetails, IIdType theId, Package parsedGraphQLRequest) {
+		// Analyse the query once so the storage layer can bulk-load referenced resources and skip reads that
+		// the engine would discard because of a type argument
+		GraphQLReferencePlan.build(parsedGraphQLRequest, theId != null ? theId.getResourceType() : null)
+				.storeIn(theRequestDetails);
+
 		IGraphQLEngine engine = myEngineFactory.get();
 		engine.setAppInfo(theRequestDetails);
 		engine.setServices(myStorageServices);

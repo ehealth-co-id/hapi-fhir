@@ -74,6 +74,28 @@ public class DaoRegistryGraphQLStorageServicesTest extends BaseJpaR4Test {
 	}
 
 	@Test
+	public void testLookupIsCachedPerRequest() {
+		Patient patient = new Patient();
+		patient.setId("lookup-cache-1");
+		myPatientDao.update(patient, mySrd);
+
+		ca.uhn.fhir.rest.api.server.SystemRequestDetails request = new ca.uhn.fhir.rest.api.server.SystemRequestDetails();
+		myCaptureQueriesListener.clear();
+		IBaseResource first = mySvc.lookup(request, "Patient", "lookup-cache-1");
+		int selectsAfterFirst = myCaptureQueriesListener.countSelectQueries();
+		IBaseResource second = mySvc.lookup(request, "Patient", "lookup-cache-1");
+
+		assertThat(selectsAfterFirst).isGreaterThan(0);
+		assertThat(myCaptureQueriesListener.countSelectQueries()).isEqualTo(selectsAfterFirst);
+		assertThat(second).isSameAs(first);
+
+		// A different request must not share the cache
+		myCaptureQueriesListener.clear();
+		mySvc.lookup(new ca.uhn.fhir.rest.api.server.SystemRequestDetails(), "Patient", "lookup-cache-1");
+		assertThat(myCaptureQueriesListener.countSelectQueries()).isGreaterThan(0);
+	}
+
+	@Test
 	public void testListResourcesGraphqlArgumentConversion() {
 		createSomeAppointmentWithType("hapi-1", new CodeableConcept(new Coding("TEST_SYSTEM", "TEST_CODE", "TEST_DISPLAY")));
 
