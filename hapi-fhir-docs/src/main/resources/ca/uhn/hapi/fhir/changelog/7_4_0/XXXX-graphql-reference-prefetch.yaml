@@ -1,0 +1,14 @@
+---
+type: perf
+title: "GraphQL queries that resolve references with `resource(type: X)` no longer read each referenced
+  resource once per reference per alias. Resources resolved during a request are now cached for the
+  duration of that request only, and a reference whose type is not requested by any `resource(type: ...)`
+  field in the query is no longer read at all. As a result, a dangling or deleted reference of a type that
+  the query never asks for no longer causes the query to fail, and neither does a reference of such a type
+  that an interceptor would have denied access to. For Connection queries (`{Type}Connection`), referenced
+  resources are loaded by adding `_include` (and `_include:iterate` for references of the resolved resources)
+  to the primary search, so the number of database selects no longer grows with the number of distinct
+  referenced resources. This can be switched off with
+  `DaoRegistryGraphQLStorageServices#setIncludeReferencesEnabled(false)`, in which case referenced
+  resources are bulk-loaded with one search per resource type. Included resources are only used if they
+  are in a partition the request may read."

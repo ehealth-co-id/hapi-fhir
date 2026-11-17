@@ -29,11 +29,15 @@ import ca.uhn.fhir.jpa.api.svc.ISearchCoordinatorSvc;
 import ca.uhn.fhir.jpa.partition.IRequestPartitionHelperSvc;
 import ca.uhn.fhir.jpa.searchparam.SearchParameterMap;
 import ca.uhn.fhir.model.api.IQueryParameterOr;
+import ca.uhn.fhir.model.api.Include;
+import ca.uhn.fhir.model.api.ResourceMetadataKeyEnum;
+import ca.uhn.fhir.model.valueset.BundleEntrySearchModeEnum;
 import ca.uhn.fhir.model.valueset.BundleTypeEnum;
 import ca.uhn.fhir.rest.api.BundleLinks;
 import ca.uhn.fhir.rest.api.CacheControlDirective;
 import ca.uhn.fhir.rest.api.Constants;
 import ca.uhn.fhir.rest.api.IVersionSpecificBundleFactory;
+import ca.uhn.fhir.rest.api.RestSearchParameterTypeEnum;
 import ca.uhn.fhir.rest.api.server.IBundleProvider;
 import ca.uhn.fhir.rest.api.server.RequestDetails;
 import ca.uhn.fhir.rest.param.DateOrListParam;
@@ -57,6 +61,7 @@ import ca.uhn.fhir.rest.server.exceptions.ResourceGoneException;
 import ca.uhn.fhir.rest.server.util.ISearchParamRegistry;
 import ca.uhn.fhir.rest.server.util.ResourceSearchParams;
 import jakarta.annotation.Nonnull;
+import jakarta.annotation.Nullable;
 import org.apache.commons.lang3.Validate;
 import org.hl7.fhir.exceptions.FHIRException;
 import org.hl7.fhir.instance.model.api.IBaseBundle;
@@ -70,7 +75,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
@@ -86,6 +93,7 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 	static final String SEARCH_OFFSET_PARAM = "search-offset";
 
 	private static final int MAX_SEARCH_SIZE = 500;
+	private static final String LOOKUP_CACHE_KEY = DaoRegistryGraphQLStorageServices.class.getName() + "_LOOKUP_CACHE";
 
 	@Autowired
 	private FhirContext myContext;
@@ -236,6 +244,8 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 		params.setLoadSynchronousUpTo(MAX_SEARCH_SIZE);
 
 		RequestDetails requestDetails = (RequestDetails) theAppInfo;
+		// Includes are deliberately not used here: the synchronous search window (0..size) cuts the included
+		// resources off, so they never reach the cache and the prefetch ran anyway
 		IBundleProvider response = getDao(theType).search(params, requestDetails);
 		Integer size = response.size();
 		// We set size to null in SearchCoordinatorSvcImpl.executeQuery() if matching results exceeds count
@@ -246,7 +256,9 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 		}
 
 		Validate.notNull(size, "size is null");
-		theMatches.addAll(response.getResources(0, size));
+		List<IBaseResource> resources = response.getResources(0, size);
+		theMatches.addAll(resources);
+		prefetchReferences(requestDetails, resources);
 	}
 
 	@Transactional(propagation = Propagation.REQUIRED)
@@ -258,15 +270,196 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 	}
 
 	private IBaseResource lookup(Object theAppInfo, IIdType theRefId) {
-		IFhirResourceDao<? extends IBaseResource> dao = getDao(theRefId.getResourceType());
 		RequestDetails requestDetails = (RequestDetails) theAppInfo;
-		return dao.read(theRefId, requestDetails, false);
+
+		// The GraphQL engine resolves a reference before it checks the "type" argument, so the same target
+		// is typically looked up once per alias. Resources are cached for the lifetime of this request only
+		// (RequestDetails user data), so tenancy, partitioning and security are unaffected. The cache is also
+		// where GraphQLReferencePrefetcher puts bulk-loaded resources.
+		Map<String, IBaseResource> cache = null;
+		String key = null;
+		if (requestDetails != null) {
+			key = GraphQLReferencePrefetcher.cacheKey(theRefId);
+			if (key != null) {
+				cache = GraphQLReferencePrefetcher.getCache(requestDetails);
+				IBaseResource cached = cache.get(key);
+				if (cached != null) {
+					return cached;
+				}
+			}
+		}
+
+		IFhirResourceDao<? extends IBaseResource> dao = getDao(theRefId.getResourceType());
+		IBaseResource retVal = dao.read(theRefId, requestDetails, false);
+		if (cache != null && retVal != null) {
+			cache.put(key, retVal);
+		}
+		return retVal;
+	}
+
+	/**
+	 * The GraphQL engine looks a reference up before it checks the {@code type} argument of the field and
+	 * discards the result when the type doesn't match. If the query is fully typed (every {@code resource}
+	 * field has a plain {@code type} argument) and none of them asks for this reference's type, the lookup
+	 * can't contribute to the output, so an empty placeholder of the right type is returned instead of
+	 * reading the resource. The engine rejects it by type and emits nothing.
+	 * <p>
+	 * Note that this means a dangling or deleted reference of an un-requested type no longer fails the query.
+	 * </p>
+	 */
+	private IBaseResource newStubIfTypeNotRequested(Object theAppInfo, IIdType theRefId) {
+		if (!(theAppInfo instanceof RequestDetails) || !theRefId.hasResourceType() || theRefId.isLocal()) {
+			return null;
+		}
+		GraphQLReferencePlan plan = GraphQLReferencePlan.getFrom((RequestDetails) theAppInfo);
+		if (plan == null || !plan.isTypePushdownSafe() || plan.isTypeRequested(theRefId.getResourceType())) {
+			return null;
+		}
+		try {
+			IBaseResource stub =
+					myContext.getResourceDefinition(theRefId.getResourceType()).newInstance();
+			stub.setId(theRefId.toUnqualifiedVersionless());
+			return stub;
+		} catch (RuntimeException e) {
+			// Unknown resource type etc: let the normal path produce its usual error
+			return null;
+		}
+	}
+
+	private boolean myIncludeReferencesEnabled = true;
+
+	/**
+	 * If enabled (the default), references that a query resolves with {@code resource(type: X)} are loaded by
+	 * adding {@code _include} (and {@code _include:iterate} for references of those resources) to the primary
+	 * search of a Connection query, instead of one search per referenced type. This needs a handful of selects
+	 * regardless of the number of distinct targets, where the per-type search needs one select per distinct id.
+	 * Anything the include does not load is still loaded by the per-type prefetch, then by a plain read.
+	 */
+	public boolean isIncludeReferencesEnabled() {
+		return myIncludeReferencesEnabled;
+	}
+
+	public void setIncludeReferencesEnabled(boolean theIncludeReferencesEnabled) {
+		myIncludeReferencesEnabled = theIncludeReferencesEnabled;
+	}
+
+	private void addReferenceIncludes(String theType, SearchParameterMap theParams, RequestDetails theRequestDetails) {
+		if (!myIncludeReferencesEnabled) {
+			return;
+		}
+		GraphQLReferencePlan plan = GraphQLReferencePlan.getFrom(theRequestDetails);
+		if (plan == null) {
+			return;
+		}
+		for (String path : plan.getReferencePaths(theType)) {
+			RuntimeSearchParam param = findReferenceSearchParam(theType, path);
+			if (param != null) {
+				theParams.addInclude(new Include(theType + ":" + param.getName()));
+			}
+		}
+		// References of resolved resources (e.g. Patient.managingOrganization behind actor.resource(type: Patient))
+		// are followed with _include:iterate, so they don't need a read per distinct target either
+		for (Map.Entry<String, Set<String>> nested :
+				plan.getNestedReferencePaths().entrySet()) {
+			for (String path : nested.getValue()) {
+				RuntimeSearchParam param = findReferenceSearchParam(nested.getKey(), path);
+				if (param != null) {
+					theParams.addInclude(new Include(nested.getKey() + ":" + param.getName(), true));
+				}
+			}
+		}
+	}
+
+	/**
+	 * Several parameters can share a path (e.g. Coverage.beneficiary: beneficiary and patient). Prefer the one that
+	 * covers the fewest paths, so the include does not load more than the query needs, and break ties by name so
+	 * that the choice does not depend on map iteration order.
+	 *
+	 * @return The reference parameter of the type whose path is exactly the given one, or null if there is none, in
+	 * which case the references on that path are loaded by the prefetch
+	 */
+	@Nullable
+	private RuntimeSearchParam findReferenceSearchParam(String theType, String thePath) {
+		RuntimeSearchParam best = null;
+		for (RuntimeSearchParam searchParam :
+				mySearchParamRegistry.getActiveSearchParams(theType).values()) {
+			if (searchParam.getParamType() != RestSearchParameterTypeEnum.REFERENCE
+					|| !searchParam.getPathsSplit().contains(thePath)) {
+				continue;
+			}
+			if (best == null
+					|| searchParam.getPathsSplit().size() < best.getPathsSplit().size()
+					|| (searchParam.getPathsSplit().size()
+									== best.getPathsSplit().size()
+							&& searchParam.getName().compareTo(best.getName()) < 0)) {
+				best = searchParam;
+			}
+		}
+		return best;
+	}
+
+	/**
+	 * Included resources come back mixed in with the matches. Move them into the per-request cache and return
+	 * only the matches, so they don't show up as results (e.g. as extra connection edges).
+	 */
+	private List<IBaseResource> moveIncludesToCache(
+			RequestDetails theRequestDetails, List<IBaseResource> theResources) {
+		if (!myIncludeReferencesEnabled) {
+			return theResources;
+		}
+		List<IBaseResource> matches = new ArrayList<>(theResources.size());
+		Map<String, IBaseResource> cache = GraphQLReferencePrefetcher.getCache(theRequestDetails);
+		for (IBaseResource resource : theResources) {
+			if (ResourceMetadataKeyEnum.ENTRY_SEARCH_MODE.get(resource) == BundleEntrySearchModeEnum.INCLUDE) {
+				String key = GraphQLReferencePrefetcher.cacheKey(resource.getIdElement());
+				if (key != null && isReadablePartition(theRequestDetails, resource)) {
+					cache.put(
+							myContext.getResourceType(resource) + "/"
+									+ resource.getIdElement().getIdPart(),
+							resource);
+				}
+			} else {
+				matches.add(resource);
+			}
+		}
+		return matches;
+	}
+
+	/**
+	 * An _include crosses partitions (it follows the reference index by row id), whereas a read or the prefetch
+	 * search only sees the partition(s) the request may read. A resource from a partition this request can't read
+	 * must not enter the per-request cache, otherwise {@code lookup()} would serve it from the cache and skip the
+	 * partition check a plain read applies. Not caching it leaves it to the prefetch/read, which behave as on the
+	 * default path.
+	 */
+	private boolean isReadablePartition(RequestDetails theRequestDetails, IBaseResource theResource) {
+		Object partition = theResource.getUserData(Constants.RESOURCE_PARTITION_ID);
+		if (!(partition instanceof RequestPartitionId) || !((RequestPartitionId) partition).hasPartitionIds()) {
+			// partitioning is off (user data is only set when it is on)
+			return true;
+		}
+		IIdType id = theResource.getIdElement().toUnqualifiedVersionless();
+		RequestPartitionId readPartition = myPartitionHelperSvc.determineReadPartitionForRequestForRead(
+				theRequestDetails, myContext.getResourceType(theResource), id);
+		RequestPartitionId resourcePartition = (RequestPartitionId) partition;
+		if (readPartition == null || readPartition.isAllPartitions()) {
+			return true;
+		}
+		return resourcePartition.getPartitionIds().stream().allMatch(readPartition::isPartitionCovered);
+	}
+
+	private void prefetchReferences(RequestDetails theRequestDetails, List<? extends IBaseResource> theResources) {
+		new GraphQLReferencePrefetcher(myContext, myDaoRegistry).prefetch(theRequestDetails, theResources);
 	}
 
 	@Transactional(propagation = Propagation.REQUIRED)
 	@Override
 	public ReferenceResolution lookup(Object theAppInfo, IBaseResource theContext, IBaseReference theReference)
 			throws FHIRException {
+		IBaseResource stub = newStubIfTypeNotRequested(theAppInfo, theReference.getReferenceElement());
+		if (stub != null) {
+			return new ReferenceResolution(theContext, stub);
+		}
 		IBaseResource outcome = lookup(theAppInfo, theReference.getReferenceElement());
 		if (outcome == null) {
 			return null;
@@ -310,6 +503,7 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 
 			SearchParameterMap params = buildSearchParams(theType, theSearchParams);
 			params.setCount(pageSize);
+			addReferenceIncludes(theType, params, requestDetails);
 
 			CacheControlDirective cacheControlDirective = new CacheControlDirective();
 			cacheControlDirective.parse(requestDetails.getHeaders(Constants.HEADER_CACHE_CONTROL));
@@ -363,10 +557,12 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 
 		List<IBaseResource> resourceList;
 		try {
-			resourceList = response.getResources(searchOffset, numToReturn + searchOffset);
+			resourceList = moveIncludesToCache(
+					requestDetails, response.getResources(searchOffset, numToReturn + searchOffset));
 		} catch (ResourceGoneException e) {
 			throw newInvalidCursorException(searchId);
 		}
+		prefetchReferences(requestDetails, resourceList);
 
 		IVersionSpecificBundleFactory bundleFactory = myContext.newBundleFactory();
 		bundleFactory.addRootPropertiesToBundle(response.getUuid(), links, response.size(), response.getPublished());
