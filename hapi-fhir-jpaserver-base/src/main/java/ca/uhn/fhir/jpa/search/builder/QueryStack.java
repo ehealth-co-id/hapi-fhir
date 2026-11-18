@@ -29,6 +29,9 @@ import ca.uhn.fhir.jpa.dao.BaseHapiFhirDao;
 import ca.uhn.fhir.jpa.dao.BaseStorageDao;
 import ca.uhn.fhir.jpa.dao.data.ITagDefinitionDao;
 import ca.uhn.fhir.jpa.dao.predicate.SearchFilterParser;
+import ca.uhn.fhir.jpa.dao.predicate.optimizer.FilterNaryLogical;
+import ca.uhn.fhir.jpa.dao.predicate.optimizer.FilterParameterOrList;
+import ca.uhn.fhir.jpa.dao.predicate.optimizer.SearchFilterOptimizer;
 import ca.uhn.fhir.jpa.model.config.PartitionSettings;
 import ca.uhn.fhir.jpa.model.dao.JpaPid;
 import ca.uhn.fhir.jpa.model.entity.NormalizedQuantitySearchLevel;
@@ -147,6 +150,7 @@ import static org.apache.commons.lang3.StringUtils.split;
 public class QueryStack {
 
 	private static final Logger ourLog = LoggerFactory.getLogger(QueryStack.class);
+	private static final SearchFilterOptimizer ourFilterOptimizer = SearchFilterOptimizer.createDefault();
 	public static final String LOCATION_POSITION = "Location.position";
 	private static final Pattern PATTERN_DOT_AND_ALL_AFTER = Pattern.compile("\\..*");
 
@@ -999,6 +1003,26 @@ public class QueryStack {
 					(SearchFilterParser.FilterParameter) theFilter,
 					theResourceName,
 					theRequestPartitionId);
+		} else if (theFilter instanceof FilterParameterOrList) {
+			return createPredicateFilterOrList(
+					theQueryStack3,
+					(FilterParameterOrList) theFilter,
+					theResourceName,
+					theRequestPartitionId);
+		} else if (theFilter instanceof FilterNaryLogical) {
+			FilterNaryLogical nary = (FilterNaryLogical) theFilter;
+			Object[] predicates = nary.getOperands().stream()
+					.map(t -> createPredicateFilter(theQueryStack3, t, theResourceName, theRequestPartitionId))
+					.toArray();
+			if (nary.getOperation() == SearchFilterParser.FilterLogicalOperation.and) {
+				return ComboCondition.and(predicates);
+			} else if (nary.getOperation() == SearchFilterParser.FilterLogicalOperation.or) {
+				return ComboCondition.or(predicates);
+			} else {
+				// Shouldn't happen
+				throw new InvalidRequestException(
+						Msg.code(1205) + "Don't know how to handle operation " + nary.getOperation());
+			}
 		} else if (theFilter instanceof SearchFilterParser.FilterLogical) {
 			// Left side
 			Condition xPredicate = createPredicateFilter(
@@ -1031,6 +1055,65 @@ public class QueryStack {
 					((SearchFilterParser.FilterParameterGroup) theFilter).getContained(),
 					theResourceName,
 					theRequestPartitionId);
+		}
+	}
+
+	/**
+	 * Lowers several same-parameter, same-operator leaves that were joined by <code>or</code> (merged by the
+	 * {@link SearchFilterOptimizer}) to ONE multi-valued predicate, i.e. one index join instead of one per leaf.
+	 */
+	private Condition createPredicateFilterOrList(
+			QueryStack theQueryStack3,
+			FilterParameterOrList theFilter,
+			String theResourceName,
+			RequestPartitionId theRequestPartitionId) {
+
+		String paramName = theFilter.getParamName();
+		RuntimeSearchParam searchParam = mySearchParamRegistry.getActiveSearchParam(theResourceName, paramName);
+		if (searchParam == null) {
+			// The optimizer only merges known parameters, so this cannot normally happen
+			throw new InvalidRequestException(Msg.code(1206) + "Invalid search parameter " + paramName);
+		}
+		SearchFilterParser.CompareOperation operation = theFilter.getOperation();
+		List<String> values = theFilter.getValues();
+
+		switch (searchParam.getParamType()) {
+			case TOKEN: {
+				List<TokenParam> params = new ArrayList<>();
+				for (String value : values) {
+					TokenParam param = new TokenParam();
+					param.setValueAsQueryToken(null, null, null, value);
+					params.add(param);
+				}
+				return theQueryStack3.createPredicateToken(
+						null, theResourceName, null, searchParam, params, operation, theRequestPartitionId);
+			}
+			case STRING: {
+				List<StringParam> params = new ArrayList<>();
+				for (String value : values) {
+					params.add(new StringParam(value));
+				}
+				return theQueryStack3.createPredicateString(
+						null, theResourceName, null, searchParam, params, operation, theRequestPartitionId);
+			}
+			case REFERENCE: {
+				List<ReferenceParam> params = new ArrayList<>();
+				for (String value : values) {
+					params.add(new ReferenceParam(null, null, value));
+				}
+				return theQueryStack3.createPredicateReference(
+						null,
+						theResourceName,
+						paramName,
+						new ArrayList<>(),
+						params,
+						operation,
+						searchParam,
+						theRequestPartitionId);
+			}
+			default:
+				throw new InvalidRequestException(Msg.code(1207) + "Unexpected merged _filter parameter type "
+						+ searchParam.getParamType() + " for " + paramName);
 		}
 	}
 
@@ -2911,8 +2994,20 @@ public class QueryStack {
 										+ " parameter is disabled on this server");
 							}
 
-							Condition predicate =
-									createPredicateFilter(this, filter, theResourceName, theRequestPartitionId);
+							// Rewrite the parsed filter (e.g. merge "x eq A or x eq B" into one multi-valued
+							// predicate) so that fewer index joins are generated
+							filter = ourFilterOptimizer.optimize(filter, paramName -> {
+								if (IAnyResource.SP_RES_ID.equals(paramName)
+										|| Constants.PARAM_SOURCE.equals(paramName)) {
+									return Optional.empty();
+								}
+								return Optional.ofNullable(
+												mySearchParamRegistry.getActiveSearchParam(theResourceName, paramName))
+										.map(RuntimeSearchParam::getParamType);
+							});
+
+							Condition predicate = createPredicateFilter(
+									this, filter, theResourceName, theRequestPartitionId);
 							if (predicate != null) {
 								mySqlBuilder.addPredicate(predicate);
 							}

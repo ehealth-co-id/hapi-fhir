@@ -1338,4 +1338,144 @@ public class FhirResourceDaoR4FilterTest extends BaseJpaR4Test {
 
 		assertThat(actual).hasSize(5);
 	}
+
+	// ---- _filter optimizer: OR of same-parameter leaves is merged into one multi-valued predicate ----
+
+	private List<String> searchFilter(String theFilter) {
+		SearchParameterMap map = new SearchParameterMap();
+		map.setLoadSynchronous(true);
+		map.add(Constants.PARAM_FILTER, new StringParam(theFilter));
+		myCaptureQueriesListener.clear();
+		List<String> retVal = toUnqualifiedVersionlessIdValues(myPatientDao.search(map));
+		myCaptureQueriesListener.logSelectQueriesForCurrentThread(0);
+		return retVal;
+	}
+
+	private int countJoins(String theTable) {
+		String sql = myCaptureQueriesListener.getSelectQueriesForCurrentThread().get(0).getSql(true, false).toLowerCase();
+		return org.apache.commons.lang3.StringUtils.countMatches(sql, "join " + theTable.toLowerCase());
+	}
+
+	private String createPatient(String theGender, String theFamily, boolean theActive, String theOrgId, String theBirthDate, String theIdentifierSystem, String theIdentifierValue) {
+		Patient p = new Patient();
+		if (theGender != null) {
+			p.setGender(Enumerations.AdministrativeGender.fromCode(theGender));
+		}
+		p.addName().setFamily(theFamily);
+		p.setActive(theActive);
+		if (theOrgId != null) {
+			p.setManagingOrganization(new Reference(theOrgId));
+		}
+		if (theBirthDate != null) {
+			p.setBirthDateElement(new DateType(theBirthDate));
+		}
+		if (theIdentifierValue != null) {
+			p.addIdentifier().setSystem(theIdentifierSystem).setValue(theIdentifierValue);
+		}
+		return myPatientDao.create(p).getId().toUnqualifiedVersionless().getValue();
+	}
+
+	@Test
+	public void testOptimizer_OrOfTokens_OneJoin_SameResultsAsPlainSearch() {
+		String male = createPatient("male", "A", true, null, null, null, null);
+		String female = createPatient("female", "B", true, null, null, null, null);
+		String other = createPatient("other", "C", false, null, null, null, null);
+		createPatient("unknown", "D", true, null, null, null, null);
+
+		List<String> found = searchFilter("(gender eq male) or (gender eq female) or (gender eq other)");
+		assertThat(found).containsExactly(male, female, other);
+		assertThat(countJoins("hfj_spidx_token")).isEqualTo(1);
+
+		// Same ids and order as the equivalent plain search
+		SearchParameterMap plain = new SearchParameterMap();
+		plain.setLoadSynchronous(true);
+		plain.add("gender", new ca.uhn.fhir.rest.param.TokenOrListParam().addOr(new TokenParam("male")).addOr(new TokenParam("female")).addOr(new TokenParam("other")));
+		assertThat(toUnqualifiedVersionlessIdValues(myPatientDao.search(plain))).isEqualTo(found);
+
+		// A code with no rows, and a duplicated value
+		assertThat(searchFilter("(gender eq male) or (gender eq nosuchcode) or (gender eq male)")).containsExactly(male);
+		assertThat(countJoins("hfj_spidx_token")).isEqualTo(1);
+	}
+
+	@Test
+	public void testOptimizer_OrOfTokens_WithAndWithoutSystem() {
+		String id1 = createPatient("male", "A", true, null, null, "urn:sys", "1");
+		String id2 = createPatient("male", "B", true, null, null, "urn:other", "2");
+		createPatient("male", "C", true, null, null, "urn:sys", "3");
+
+		assertThat(searchFilter("identifier eq urn:sys|1 or identifier eq 2")).containsExactly(id1, id2);
+		assertThat(countJoins("hfj_spidx_token")).isEqualTo(1);
+	}
+
+	@Test
+	public void testOptimizer_OrOfDifferentParameters_KeepsSeparateJoins() {
+		String maleInactive = createPatient("male", "A", false, null, null, null, null);
+		String femaleActive = createPatient("female", "B", true, null, null, null, null);
+		createPatient("female", "C", false, null, null, null, null);
+
+		assertThat(searchFilter("gender eq male or active eq true")).containsExactly(maleInactive, femaleActive);
+		assertThat(countJoins("hfj_spidx_token")).isEqualTo(2);
+	}
+
+	@Test
+	public void testOptimizer_OrOfStrings_OneJoin() {
+		String smith = createPatient("male", "Smith", true, null, null, null, null);
+		String jones = createPatient("male", "Jones", true, null, null, null, null);
+		createPatient("male", "Brown", true, null, null, null, null);
+
+		assertThat(searchFilter("family eq smith or family eq jones")).containsExactly(smith, jones);
+		assertThat(countJoins("hfj_spidx_string")).isEqualTo(1);
+		assertThat(searchFilter("family sw smi or family sw jon")).containsExactly(smith, jones);
+		assertThat(countJoins("hfj_spidx_string")).isEqualTo(1);
+		// Different operators must not be merged
+		assertThat(searchFilter("family sw smi or family eq jones")).containsExactly(smith, jones);
+		assertThat(countJoins("hfj_spidx_string")).isEqualTo(2);
+	}
+
+	@Test
+	public void testOptimizer_OrOfReferences_SameResultsAsPlainSearch() {
+		IIdType orgId1 = myOrganizationDao.create(new org.hl7.fhir.r4.model.Organization().setName("1")).getId().toUnqualifiedVersionless();
+		IIdType orgId2 = myOrganizationDao.create(new org.hl7.fhir.r4.model.Organization().setName("2")).getId().toUnqualifiedVersionless();
+		IIdType orgId3 = myOrganizationDao.create(new org.hl7.fhir.r4.model.Organization().setName("3")).getId().toUnqualifiedVersionless();
+		String p1 = createPatient("male", "A", true, orgId1.getValue(), null, null, null);
+		String p2 = createPatient("male", "B", true, orgId2.getValue(), null, null, null);
+		createPatient("male", "C", true, orgId3.getValue(), null, null, null);
+
+		List<String> found = searchFilter("organization eq " + orgId1.getIdPart() + " or organization eq " + orgId2.getIdPart());
+		assertThat(found).containsExactly(p1, p2);
+		assertThat(countJoins("hfj_res_link")).isEqualTo(1);
+
+		SearchParameterMap plain = new SearchParameterMap();
+		plain.setLoadSynchronous(true);
+		plain.add("organization", new ca.uhn.fhir.rest.param.ReferenceOrListParam()
+			.addOr(new ca.uhn.fhir.rest.param.ReferenceParam(orgId1.getValue()))
+			.addOr(new ca.uhn.fhir.rest.param.ReferenceParam(orgId2.getValue())));
+		assertThat(toUnqualifiedVersionlessIdValues(myPatientDao.search(plain))).isEqualTo(found);
+	}
+
+	@Test
+	public void testOptimizer_ProductionShape_SameResultsAsPlainSearch() {
+		IIdType orgId = myOrganizationDao.create(new org.hl7.fhir.r4.model.Organization().setName("1")).getId().toUnqualifiedVersionless();
+		IIdType otherOrgId = myOrganizationDao.create(new org.hl7.fhir.r4.model.Organization().setName("2")).getId().toUnqualifiedVersionless();
+		String match1 = createPatient("male", "A", true, orgId.getValue(), "2020-01-01", null, null);
+		String match2 = createPatient("female", "B", true, orgId.getValue(), "2020-12-31", null, null);
+		createPatient("other", "C", true, orgId.getValue(), "2020-06-01", null, null); // wrong gender
+		createPatient("male", "D", true, orgId.getValue(), "2021-01-01", null, null); // date too late
+		createPatient("male", "E", true, orgId.getValue(), "2019-12-31", null, null); // date too early
+		createPatient("male", "F", true, otherOrgId.getValue(), "2020-06-01", null, null); // wrong org
+
+		String filter = "(organization eq " + orgId.getIdPart() + ") and (birthdate ge 2020-01-01) and (birthdate le 2020-12-31) and ((gender eq male) or (gender eq female))";
+		List<String> found = searchFilter(filter);
+		assertThat(found).containsExactly(match1, match2);
+		assertThat(countJoins("hfj_spidx_token")).isEqualTo(1);
+
+		SearchParameterMap plain = new SearchParameterMap();
+		plain.setLoadSynchronous(true);
+		plain.add("organization", new ca.uhn.fhir.rest.param.ReferenceParam(orgId.getValue()));
+		plain.add("birthdate", new ca.uhn.fhir.rest.param.DateAndListParam()
+			.addAnd(new ca.uhn.fhir.rest.param.DateOrListParam().addOr(new ca.uhn.fhir.rest.param.DateParam(ca.uhn.fhir.rest.param.ParamPrefixEnum.GREATERTHAN_OR_EQUALS, "2020-01-01")))
+			.addAnd(new ca.uhn.fhir.rest.param.DateOrListParam().addOr(new ca.uhn.fhir.rest.param.DateParam(ca.uhn.fhir.rest.param.ParamPrefixEnum.LESSTHAN_OR_EQUALS, "2020-12-31"))));
+		plain.add("gender", new ca.uhn.fhir.rest.param.TokenOrListParam().addOr(new TokenParam("male")).addOr(new TokenParam("female")));
+		assertThat(toUnqualifiedVersionlessIdValues(myPatientDao.search(plain))).isEqualTo(found);
+	}
 }
