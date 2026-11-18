@@ -60,6 +60,7 @@ import ca.uhn.fhir.rest.server.exceptions.InvalidRequestException;
 import ca.uhn.fhir.rest.server.exceptions.ResourceGoneException;
 import ca.uhn.fhir.rest.server.util.ISearchParamRegistry;
 import ca.uhn.fhir.rest.server.util.ResourceSearchParams;
+import ca.uhn.fhir.util.UrlUtil;
 import jakarta.annotation.Nonnull;
 import jakarta.annotation.Nullable;
 import org.apache.commons.lang3.Validate;
@@ -474,6 +475,39 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 				.findAny();
 	}
 
+	/**
+	 * @param theTotal    The total number of matches, or null if the search hasn't been read to its end yet
+	 * @param theOffset   The offset of the page that was just read
+	 * @param theReturned The number of matches on that page (included resources excluded)
+	 * @param thePageSize The requested page size, at least 1
+	 */
+	static boolean hasNextPage(Integer theTotal, int theOffset, int theReturned, int thePageSize) {
+		if (theTotal != null) {
+			return (theOffset + theReturned) < theTotal;
+		}
+		// Total unknown: a full page means there may be more, a short page means this was the last one
+		return theReturned >= thePageSize;
+	}
+
+	/**
+	 * Cursor and page size come from the request, so a bad value is a client error (HTTP 400), not a failure.
+	 * A page size below 1 would also make the next link point at the same offset forever.
+	 */
+	private static int parseIntArgument(String theName, String theValue, int theMin, int theMsgCode) {
+		int value;
+		try {
+			value = Integer.parseInt(theValue.trim());
+		} catch (NumberFormatException e) {
+			throw new InvalidRequestException(Msg.code(theMsgCode) + "GraphQL argument \"" + theName
+					+ "\" must be an integer but was: " + UrlUtil.sanitizeUrlPart(theValue));
+		}
+		if (value < theMin) {
+			throw new InvalidRequestException(Msg.code(theMsgCode) + "GraphQL argument \"" + theName
+					+ "\" must be at least " + theMin + " but was: " + value);
+		}
+		return value;
+	}
+
 	@Transactional(propagation = Propagation.NEVER)
 	@Override
 	public IBaseBundle search(Object theAppInfo, String theType, List<Argument> theSearchParams) throws FHIRException {
@@ -489,7 +523,7 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 
 		if (searchIdArgument.isPresent() && searchOffsetArgument.isPresent()) {
 			searchId = searchIdArgument.get();
-			searchOffset = Integer.parseInt(searchOffsetArgument.get());
+			searchOffset = parseIntArgument(SEARCH_OFFSET_PARAM, searchOffsetArgument.get(), 0, 2830);
 
 			response = Optional.ofNullable(myPagingProvider.retrieveResultList(requestDetails, searchId))
 					.orElseThrow(() -> newInvalidCursorException(searchId));
@@ -497,9 +531,10 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 			pageSize =
 					Optional.ofNullable(response.preferredPageSize()).orElseGet(myPagingProvider::getDefaultPageSize);
 		} else {
-			pageSize = getArgument(theSearchParams, "_count")
-					.map(Integer::parseInt)
-					.orElseGet(myPagingProvider::getDefaultPageSize);
+			Optional<String> countArgument = getArgument(theSearchParams, "_count");
+			pageSize = countArgument.isPresent()
+					? parseIntArgument("_count", countArgument.get(), 1, 2831)
+					: myPagingProvider.getDefaultPageSize();
 
 			SearchParameterMap params = buildSearchParams(theType, theSearchParams);
 			params.setCount(pageSize);
@@ -515,17 +550,35 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 			searchId = myPagingProvider.storeResultList(requestDetails, response);
 		}
 
-		// response.size() may return {@literal null}, in that case use pageSize
 		String serverBase = requestDetails.getFhirServerBase();
-		Optional<Integer> numTotalResults;
+
+		// response.size() is null while the total is not known yet (the search has not been read to its end), in
+		// that case ask for a full page. A cursor past the end of the results yields an empty page, not an error.
+		Integer totalBefore;
 		try {
-			numTotalResults = Optional.ofNullable(response.size());
+			totalBefore = response.size();
 		} catch (ResourceGoneException e) {
 			throw newInvalidCursorException(searchId);
 		}
-		int numToReturn = numTotalResults
-				.map(integer -> Math.min(pageSize, integer - searchOffset))
-				.orElse(pageSize);
+		int numToReturn = totalBefore == null ? pageSize : Math.max(0, Math.min(pageSize, totalBefore - searchOffset));
+
+		List<IBaseResource> resourceList;
+		try {
+			resourceList = numToReturn == 0
+					? new ArrayList<>()
+					: moveIncludesToCache(
+							requestDetails, response.getResources(searchOffset, numToReturn + searchOffset));
+		} catch (ResourceGoneException e) {
+			throw newInvalidCursorException(searchId);
+		}
+		prefetchReferences(requestDetails, resourceList);
+
+		// Decide on the next link only now: reading the page may have completed the search, which makes the total
+		// known. If it is still unknown, a short page means that this was the last one. (Deciding before reading
+		// the page produced a next link past the end on the last page, which then failed with a negative index.)
+		Integer total = response.size();
+		boolean hasNext =
+				total != null ? (searchOffset + resourceList.size()) < total : resourceList.size() >= pageSize;
 
 		BundleLinks links = new BundleLinks(
 				requestDetails.getServerBaseForRequest(),
@@ -539,13 +592,9 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 		String linkSelf = String.format(linkFormat, serverBase, theType, searchId, searchOffset, pageSize);
 		links.setSelf(linkSelf);
 
-		boolean hasNext = numTotalResults
-				.map(total -> (searchOffset + numToReturn) < total)
-				.orElse(true);
-
 		if (hasNext) {
-			String linkNext =
-					String.format(linkFormat, serverBase, theType, searchId, searchOffset + numToReturn, pageSize);
+			String linkNext = String.format(
+					linkFormat, serverBase, theType, searchId, searchOffset + resourceList.size(), pageSize);
 			links.setNext(linkNext);
 		}
 
@@ -554,15 +603,6 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 					linkFormat, serverBase, theType, searchId, Math.max(0, searchOffset - pageSize), pageSize);
 			links.setPrev(linkPrev);
 		}
-
-		List<IBaseResource> resourceList;
-		try {
-			resourceList = moveIncludesToCache(
-					requestDetails, response.getResources(searchOffset, numToReturn + searchOffset));
-		} catch (ResourceGoneException e) {
-			throw newInvalidCursorException(searchId);
-		}
-		prefetchReferences(requestDetails, resourceList);
 
 		IVersionSpecificBundleFactory bundleFactory = myContext.newBundleFactory();
 		bundleFactory.addRootPropertiesToBundle(response.getUuid(), links, response.size(), response.getPublished());
