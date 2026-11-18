@@ -11,7 +11,7 @@
 	</parent>
 
 	<artifactId>hapi-fhir-storage</artifactId>
-	<version>7.4.0-ehealth.1</version>
+	<version>7.4.0-ehealth.2</version>
 	<packaging>jar</packaging>
 
 	<name>HAPI FHIR Storage api</name>

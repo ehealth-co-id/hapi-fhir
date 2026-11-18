@@ -522,6 +522,72 @@ public class GraphQLR4Test extends BaseResourceProviderR4Test {
 		}
 	}
 
+	/**
+	 * Follows the {@code next} cursor of a Connection page by page ({@code cursor: "searchId:offset"}). The last page
+	 * must not point to a further page, and a cursor beyond the end of the results must not fail the query.
+	 */
+	@Test
+	public void testPatientConnection_FollowNextCursor_ToTheEnd() throws IOException {
+		int total = 507;
+		for (int i = 0; i < total; i++) {
+			Patient p = new Patient();
+			p.setId("cpat" + i);
+			myPatientDao.update(p, mySrd);
+		}
+
+		java.util.Set<String> ids = new java.util.HashSet<>();
+		String cursor = null;
+		String lastCursor = null;
+		int pages = 0;
+		do {
+			String args = cursor == null ? "_count:250" : "_count:250 cursor:\"" + cursor + "\"";
+			String resp = executeGraphQl("{PatientConnection(" + args + "){next edges{resource{id}}}}", 200);
+			java.util.regex.Matcher id = java.util.regex.Pattern.compile("Patient/(cpat\\d+)/").matcher(resp);
+			while (id.find()) {
+				ids.add(id.group(1));
+			}
+			java.util.regex.Matcher next = java.util.regex.Pattern.compile("\"next\":\"([^\"]+)\"").matcher(resp);
+			lastCursor = cursor;
+			cursor = next.find() ? next.group(1) : null;
+			pages++;
+			ourLog.info("GRAPHQL-CURSOR page={} next={} ids={}", pages, cursor, ids.size());
+		} while (cursor != null && pages < 10);
+
+		assertThat(ids).hasSize(total);
+		assertThat(cursor).as("the last page has no next cursor").isNull();
+		assertThat(pages).isEqualTo(3);
+
+		// A cursor past the end (e.g. one followed after the total became known) yields an empty page, not an error
+		String searchId = lastCursor.substring(0, lastCursor.indexOf(':'));
+		String beyond = executeGraphQl("{PatientConnection(_count:250 cursor:\"" + searchId + ":750\"){next edges{resource{id}}}}", 200);
+		assertThat(beyond).doesNotContain("cpat").doesNotContain("\"next\"");
+	}
+
+	/**
+	 * A bad cursor offset or page size is a client error (400), not a failure (500), and a page size below 1 must not
+	 * produce a next cursor that never advances.
+	 */
+	@Test
+	public void testPatientConnection_InvalidCursorOffsetOrCount_Is400() throws IOException {
+		for (int i = 0; i < 3; i++) {
+			Patient p = new Patient();
+			p.setId("bpat" + i);
+			myPatientDao.update(p, mySrd);
+		}
+		String first = executeGraphQl("{PatientConnection(_count:2){next edges{resource{id}}}}", 200);
+		java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"next\":\"([^:\"]+):2\"").matcher(first);
+		assertThat(m.find()).isTrue();
+		String searchId = m.group(1);
+
+		String negative = executeGraphQl("{PatientConnection(_count:2 cursor:\"" + searchId + ":-5\"){next edges{resource{id}}}}", 400);
+		assertThat(negative).contains("search-offset").contains("at least 0");
+		String nonNumeric = executeGraphQl("{PatientConnection(_count:2 cursor:\"" + searchId + ":abc\"){next edges{resource{id}}}}", 400);
+		assertThat(nonNumeric).contains("search-offset").contains("must be an integer");
+
+		assertThat(executeGraphQl("{PatientConnection(_count:0){next edges{resource{id}}}}", 400)).contains("_count").contains("at least 1");
+		assertThat(executeGraphQl("{PatientConnection(_count:-1){next edges{resource{id}}}}", 400)).contains("_count").contains("at least 1");
+	}
+
 	private int lastSelects;
 
 	private String runConnection(int theCount, boolean theInclude) throws IOException {

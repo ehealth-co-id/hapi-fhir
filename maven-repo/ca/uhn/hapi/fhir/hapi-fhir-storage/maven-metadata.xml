@@ -3,10 +3,11 @@
   <groupId>ca.uhn.hapi.fhir</groupId>
   <artifactId>hapi-fhir-storage</artifactId>
   <versioning>
-    <release>7.4.0-ehealth.1</release>
+    <release>7.4.0-ehealth.2</release>
     <versions>
       <version>7.4.0-ehealth.1</version>
+      <version>7.4.0-ehealth.2</version>
     </versions>
-    <lastUpdated>20261117120905</lastUpdated>
+    <lastUpdated>20261118000803</lastUpdated>
   </versioning>
 </metadata>
