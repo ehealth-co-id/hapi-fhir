@@ -23,6 +23,7 @@ import ca.uhn.fhir.context.FhirContext;
 import ca.uhn.fhir.context.RuntimeResourceDefinition;
 import ca.uhn.fhir.context.RuntimeSearchParam;
 import ca.uhn.fhir.i18n.Msg;
+import ca.uhn.fhir.interceptor.model.RequestPartitionId;
 import ca.uhn.fhir.jpa.api.dao.DaoRegistry;
 import ca.uhn.fhir.jpa.api.dao.IFhirResourceDao;
 import ca.uhn.fhir.jpa.api.svc.ISearchCoordinatorSvc;
@@ -91,6 +92,7 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 
 	// the constant hasn't already been defined in org.hl7.fhir.core so we define it here
 	static final String SEARCH_ID_PARAM = "search-id";
+	private static final char PAGE_SIZE_SEPARATOR = '~';
 	static final String SEARCH_OFFSET_PARAM = "search-offset";
 
 	private static final int MAX_SEARCH_SIZE = 500;
@@ -522,14 +524,36 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 		IBundleProvider response;
 
 		if (searchIdArgument.isPresent() && searchOffsetArgument.isPresent()) {
-			searchId = searchIdArgument.get();
+			// The search id in a next link is "<id>~<pageSize>": the GraphQL engine only hands back search-id and
+			// search-offset on a follow-up request (not _count), and the provider that the paging provider returns
+			// does not know the page size the search was created with.
+			String searchIdToken = searchIdArgument.get();
+			int separator = searchIdToken.lastIndexOf(PAGE_SIZE_SEPARATOR);
+			Integer tokenPageSize = null;
+			if (separator > 0) {
+				try {
+					tokenPageSize = Integer.parseInt(searchIdToken.substring(separator + 1));
+				} catch (NumberFormatException e) {
+					// not one of our tokens: the whole value is the search id
+				}
+			}
+			searchId = tokenPageSize != null ? searchIdToken.substring(0, separator) : searchIdToken;
 			searchOffset = parseIntArgument(SEARCH_OFFSET_PARAM, searchOffsetArgument.get(), 0, 2830);
 
 			response = Optional.ofNullable(myPagingProvider.retrieveResultList(requestDetails, searchId))
 					.orElseThrow(() -> newInvalidCursorException(searchId));
 
-			pageSize =
-					Optional.ofNullable(response.preferredPageSize()).orElseGet(myPagingProvider::getDefaultPageSize);
+			// An explicit _count wins, then the size carried in the token, then what the provider knows, then the
+			// default
+			Optional<String> pagedCountArgument = getArgument(theSearchParams, "_count");
+			if (pagedCountArgument.isPresent()) {
+				pageSize = parseIntArgument("_count", pagedCountArgument.get(), 1, 2831);
+			} else if (tokenPageSize != null && tokenPageSize >= 1) {
+				pageSize = tokenPageSize;
+			} else {
+				pageSize = Optional.ofNullable(response.preferredPageSize())
+						.orElseGet(myPagingProvider::getDefaultPageSize);
+			}
 		} else {
 			Optional<String> countArgument = getArgument(theSearchParams, "_count");
 			pageSize = countArgument.isPresent()
@@ -560,7 +584,10 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 		} catch (ResourceGoneException e) {
 			throw newInvalidCursorException(searchId);
 		}
-		int numToReturn = totalBefore == null ? pageSize : Math.max(0, Math.min(pageSize, totalBefore - searchOffset));
+		// size() can be a running count while the search is still loading (it is not necessarily the final total), so
+		// it must not be used to shrink the page: ask for a full page and let the provider return what exists.
+		// Only a cursor at or past the known count is answered with an empty page.
+		int numToReturn = (totalBefore != null && searchOffset >= totalBefore) ? 0 : pageSize;
 
 		List<IBaseResource> resourceList;
 		try {
@@ -576,9 +603,9 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 		// Decide on the next link only now: reading the page may have completed the search, which makes the total
 		// known. If it is still unknown, a short page means that this was the last one. (Deciding before reading
 		// the page produced a next link past the end on the last page, which then failed with a negative index.)
-		Integer total = response.size();
-		boolean hasNext =
-				total != null ? (searchOffset + resourceList.size()) < total : resourceList.size() >= pageSize;
+		// A full page may be followed by more; a short page is the last one. (size() is not trusted here for the
+		// reason above. When the results end exactly on a page boundary the next link leads to one empty page.)
+		boolean hasNext = hasNextPage(null, searchOffset, resourceList.size(), pageSize);
 
 		BundleLinks links = new BundleLinks(
 				requestDetails.getServerBaseForRequest(),
@@ -589,18 +616,19 @@ public class DaoRegistryGraphQLStorageServices implements IGraphQLStorageService
 		// RestfulServerUtils.createLinkSelf not suitable here
 		String linkFormat = "%s/%s?_format=application/json&search-id=%s&search-offset=%d&_count=%d";
 
-		String linkSelf = String.format(linkFormat, serverBase, theType, searchId, searchOffset, pageSize);
+		String linkSearchId = searchId + PAGE_SIZE_SEPARATOR + pageSize;
+		String linkSelf = String.format(linkFormat, serverBase, theType, linkSearchId, searchOffset, pageSize);
 		links.setSelf(linkSelf);
 
 		if (hasNext) {
 			String linkNext = String.format(
-					linkFormat, serverBase, theType, searchId, searchOffset + resourceList.size(), pageSize);
+					linkFormat, serverBase, theType, linkSearchId, searchOffset + resourceList.size(), pageSize);
 			links.setNext(linkNext);
 		}
 
 		if (searchOffset > 0) {
 			String linkPrev = String.format(
-					linkFormat, serverBase, theType, searchId, Math.max(0, searchOffset - pageSize), pageSize);
+					linkFormat, serverBase, theType, linkSearchId, Math.max(0, searchOffset - pageSize), pageSize);
 			links.setPrev(linkPrev);
 		}
 

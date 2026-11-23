@@ -1005,10 +1005,7 @@ public class QueryStack {
 					theRequestPartitionId);
 		} else if (theFilter instanceof FilterParameterOrList) {
 			return createPredicateFilterOrList(
-					theQueryStack3,
-					(FilterParameterOrList) theFilter,
-					theResourceName,
-					theRequestPartitionId);
+					theQueryStack3, (FilterParameterOrList) theFilter, theResourceName, theRequestPartitionId);
 		} else if (theFilter instanceof FilterNaryLogical) {
 			FilterNaryLogical nary = (FilterNaryLogical) theFilter;
 			Object[] predicates = nary.getOperands().stream()
@@ -3006,8 +3003,8 @@ public class QueryStack {
 										.map(RuntimeSearchParam::getParamType);
 							});
 
-							Condition predicate = createPredicateFilter(
-									this, filter, theResourceName, theRequestPartitionId);
+							Condition predicate =
+									createPredicateFilter(this, filter, theResourceName, theRequestPartitionId);
 							if (predicate != null) {
 								mySqlBuilder.addPredicate(predicate);
 							}
